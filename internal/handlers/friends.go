@@ -15,10 +15,7 @@ import (
 
 // Used to parse incoming http reqs into Go language
 type FriendShipReq struct {
-	UserID      int    `json:"user_id" binding:"required"`
-	FriendID    int    `json:"friend_id" binding:"required"`
-	Status      string `json:"status" binding:"required,oneof=pending"`
-	RequestedBy int    `json:"requested_by" binding:"required"`
+	FriendID int `json:"friend_id" binding:"required"`
 }
 
 func RegisterFriends(r *gin.Engine, pool *pgxpool.Pool) {
@@ -45,16 +42,16 @@ func SendFriendRequest(pool *pgxpool.Pool) gin.HandlerFunc {
 		}
 
 		// Store smaller ID in user_id
-		userID := req.UserID
+		currUserID := c.MustGet("user_id").(int)
 		friendID := req.FriendID
 
-		if friendID < userID {
-			userID, friendID = friendID, userID
+		if friendID < currUserID {
+			currUserID, friendID = friendID, currUserID
 		}
 
 		_, err := pool.Exec(ctx,
-			"INSERT into friendships (user_id, friend_id, requested_by, status) VALUES ($1, $2, $3, $4)",
-			userID, friendID, req.RequestedBy, req.Status)
+			"INSERT into friendships (user_id, friend_id, requested_by, status) VALUES ($1, $2, $2, $3)",
+			currUserID, friendID, "pending")
 
 		if err != nil {
 			var pgErr *pgconn.PgError

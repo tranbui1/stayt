@@ -1,10 +1,11 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	"stayt/internal/cloud"
 	"stayt/internal/handlers/sanitizer"
@@ -17,14 +18,29 @@ import (
 )
 
 type SendThoughtReq struct {
-	ReceiverID  int    `json:"receiver_id" binding:"required"`
+	ReceiverID  int64  `json:"receiver_id" binding:"required"`
 	ContentText string `json:"content_text"`
-	MediaType   string `json:"media_type" binding:"required, oneof = picture doodle music voice_memo message"`
+	MediaType   string `json:"media_type" binding:"required,oneof=picture doodle music 'voice memo' message"`
+}
+
+type NewThought struct {
+	ID          int64     `json:"id"`
+	UserID      int64     `json:"user_id"`
+	ContentText *string   `json:"content_text,omitempty"`
+	ContentURL  *string   `json:"content_url,omitempty"`
+	MediaType   string    `json:"media_type"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type UpdateThoughtReq struct {
+	ID int64 `json:"id" binding:"required"`
 }
 
 func RegisterThoughts(r *gin.Engine, pool *pgxpool.Pool, s3Client *cloud.S3Client) {
 	r.POST("/thoughts", SendThoughts(pool, s3Client))
-	r.GET("/thoughts", ListThoughts)
+	r.GET("/thoughts/unread", ListUnreadThoughts(pool, s3Client))
+	r.GET("/thoughts", ListAllReceivedThoughts(pool, s3Client))
+	r.PATCH("/thoughts/:id/viewed", UpdateThoughtViewedStatus(pool))
 }
 
 func SendThoughts(pool *pgxpool.Pool, s3Client *cloud.S3Client) gin.HandlerFunc {
@@ -43,7 +59,7 @@ func SendThoughts(pool *pgxpool.Pool, s3Client *cloud.S3Client) gin.HandlerFunc 
 
 		var req SendThoughtReq
 		ctx := c.Request.Context()
-		var contentURL *string
+		var contentKey *string
 		currentUserID := c.MustGet("user_id").(int)
 
 		thoughtData := c.PostForm("thoughtData")
@@ -63,7 +79,7 @@ func SendThoughts(pool *pgxpool.Pool, s3Client *cloud.S3Client) gin.HandlerFunc 
 			// Extract separate raw file
 			file, err := c.FormFile("rawFile")
 			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				c.JSON(http.StatusBadRequest, gin.H{"error": "raw file required does not exist"})
 				return
 			}
 
@@ -75,31 +91,30 @@ func SendThoughts(pool *pgxpool.Pool, s3Client *cloud.S3Client) gin.HandlerFunc 
 			defer openedFile.Close()
 
 			// Sanitize file before uploading to cloud
-			sanitizedFile, err := sanitizer.Sanitize(openedFile)
+			sanitizedFile, err := sanitizer.SanitizeFile(openedFile)
 			if err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file"})
 				return
 			}
 
 			bucketName := os.Getenv("AWS_S3_BUCKET")
-			key := "placeholder" // TODO: write unique url generator
+			key := generateUniqueKey(currentUserID, file.Filename)
 
 			// Upload to AWS cloud
 			client := s3Client.Client
 			_, err = client.PutObject(ctx, &s3.PutObjectInput{
 				Bucket: aws.String(bucketName),
 				Key:    aws.String(key),
-				Body:   sanitizedFile,
+				Body:   bytes.NewReader(sanitizedFile),
 			})
 
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
-
-			url := fmt.Sprintf("https://%s.s3.amazonaws.com/%s", s3Client.BucketName, key)
-			contentURL = &url
+			contentKey = &key
 		}
+
 		var contentText *string
 		if req.ContentText != "" {
 			contentText = &req.ContentText
@@ -107,8 +122,8 @@ func SendThoughts(pool *pgxpool.Pool, s3Client *cloud.S3Client) gin.HandlerFunc 
 
 		// Store thought entry in database
 		_, err := pool.Exec(ctx,
-			"INSERT into thoughts (user_id, receiver_id, content_text, content_url, media_type) VALUES $1, $2, $3, $4, $5",
-			currentUserID, req.ReceiverID, contentText, contentURL, req.MediaType)
+			"INSERT INTO thoughts (user_id, receiver_id, content_text, content_key, media_type) VALUES ($1, $2, $3, $4, $5)",
+			currentUserID, req.ReceiverID, contentText, contentKey, req.MediaType)
 
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "something went wrong"})
@@ -119,6 +134,137 @@ func SendThoughts(pool *pgxpool.Pool, s3Client *cloud.S3Client) gin.HandlerFunc 
 	}
 }
 
-func ListThoughts(c *gin.Context) {
+func ListUnreadThoughts(pool *pgxpool.Pool, s3Client *cloud.S3Client) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// List every thought that have been sent to the current user & are unread:
+		// 1) Query all thoughts that have viewed status as FALSE
+		// 2) Return JSON payload containing list of
+		ctx := c.Request.Context()
+		currUserID := c.MustGet("user_id").(int)
 
+		rows, err := pool.Query(ctx,
+			"SELECT id, user_id, content_text, content_key, media_type, created_at FROM thoughts WHERE receiver_id = $1 AND viewed = false ORDER BY created_at DESC",
+			currUserID)
+
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "something went wrong"})
+			return
+		}
+		defer rows.Close()
+
+		var thoughts []NewThought
+
+		// Scan each row and append NewThoughts struct to array
+		for rows.Next() {
+			var thought NewThought
+			var contentKey *string
+
+			if err := rows.Scan(&thought.ID, &thought.UserID, &thought.ContentText, &contentKey, &thought.MediaType, &thought.CreatedAt); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "something went wrong"})
+				return
+			}
+
+			// Generate presigned URL if necessary
+			if contentKey != nil {
+				presignURL, err := generatePresignedURL(ctx, s3Client, *contentKey)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "something went wrong"})
+					return
+				}
+				thought.ContentURL = presignURL
+			}
+			thoughts = append(thoughts, thought)
+		}
+		if err := rows.Err(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "something went wrong"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"thoughts": thoughts})
+	}
+}
+
+func UpdateThoughtViewedStatus(pool *pgxpool.Pool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Updating viewed status:
+		// 1) Query thought from JSON payload into req
+		// 2) Update viewed, return success
+
+		var req UpdateThoughtReq
+		ctx := c.Request.Context()
+		currUserID := c.MustGet("user_id").(int)
+
+		// Parse incoming HTTP req into Go struct
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		thoughtID := req.ID
+
+		// Only the receiver of a thought is allowed to mark it as viewed
+		result, err := pool.Exec(ctx,
+			"UPDATE thoughts SET viewed = true WHERE id = $1 AND receiver_id = $2",
+			thoughtID, currUserID)
+
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "something went wrong"})
+			return
+		}
+
+		if result.RowsAffected() == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "thought not found"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"message": "thought viewed status sucessfully updated"})
+	}
+}
+
+func ListAllReceivedThoughts(pool *pgxpool.Pool, s3Client *cloud.S3Client) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// List every thought that has been sent to the current user, read or not:
+		// 1) Query all thoughts where receiver_id matches current user
+		// 2) Return JSON payload containing list of thoughts
+		ctx := c.Request.Context()
+		currUserID := c.MustGet("user_id").(int)
+
+		rows, err := pool.Query(ctx,
+			"SELECT id, user_id, content_text, content_key, media_type, created_at FROM thoughts WHERE receiver_id = $1 ORDER BY created_at DESC",
+			currUserID)
+
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "something went wrong"})
+			return
+		}
+		defer rows.Close()
+
+		var thoughts []NewThought
+
+		for rows.Next() {
+			var thought NewThought
+			var contentKey *string
+
+			if err := rows.Scan(&thought.ID, &thought.UserID, &thought.ContentText, &contentKey, &thought.MediaType, &thought.CreatedAt); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "something went wrong"})
+				return
+			}
+
+			if contentKey != nil {
+				presignURL, err := generatePresignedURL(ctx, s3Client, *contentKey)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "something went wrong"})
+					return
+				}
+				thought.ContentURL = presignURL
+			}
+			thoughts = append(thoughts, thought)
+		}
+		if err := rows.Err(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "something went wrong"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"thoughts": thoughts})
+	}
 }
