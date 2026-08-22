@@ -107,6 +107,7 @@ func Login(pool *pgxpool.Pool) gin.HandlerFunc {
 
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
 		}
 
 		username := req.Username
@@ -123,10 +124,12 @@ func Login(pool *pgxpool.Pool) gin.HandlerFunc {
 		// Handle error s.t. no username match was found
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid username or password"})
+			return
 		}
 
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "something went wrong"})
+			return
 		}
 
 		// Compare the submitted password and the stored hash (password)
@@ -135,12 +138,14 @@ func Login(pool *pgxpool.Pool) gin.HandlerFunc {
 		if err != nil {
 			// Passwords did not match
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid username or password"})
+			return
 		}
 
 		// Otherwise, generate and send the JWT token
 		jwtToken, err := GenerateJWT(UserID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate a JWT token"})
+			return
 		}
 
 		c.JSON(http.StatusOK, gin.H{"token": jwtToken})

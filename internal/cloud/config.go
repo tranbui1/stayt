@@ -12,7 +12,6 @@ type S3Client struct {
 	BucketName string
 }
 
-// TODO: route client to pass into handlers/thoughts.go file, call os to get bucketName
 func Config(bucketName string) (*S3Client, error) {
 	cfg, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {

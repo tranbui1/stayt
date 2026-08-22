@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 
+	"stayt/internal/auth"
 	"stayt/internal/cloud"
 	"stayt/internal/db"
+	"stayt/internal/handlers"
 	"stayt/routes"
 
 	"github.com/gin-gonic/gin"
@@ -32,6 +34,18 @@ func main() {
 
 	// Registers the router with all routes
 	routes.RegisterRoutes(r, pool, s3Client)
+
+	protected := r.Group("/")
+	protected.Use(auth.Middleware())
+	protected.GET("/thoughts", handlers.ListAllReceivedThoughts(pool, s3Client))
+	protected.GET("/thoughts/unread", handlers.ListUnreadThoughts(pool, s3Client))
+	protected.POST("/thoughts", handlers.SendThoughts(pool, s3Client))
+	protected.PATCH("/thoughts/:id/viewed", handlers.UpdateThoughtViewedStatus(pool))
+	protected.POST("/friends", handlers.SendFriendRequest(pool))
+	protected.GET("/friends", handlers.ListFriends(pool))
+	protected.PATCH("/friends/:id/accept", handlers.AcceptFriendRequest(pool))
+	protected.PATCH("/friends/:id/reject", handlers.RejectFriendRequest(pool))
+	protected.GET("/me", handlers.ViewUserProfile(pool))
 
 	r.Run()
 }

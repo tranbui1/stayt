@@ -11,6 +11,6 @@ import (
 func RegisterRoutes(r *gin.Engine, pool *pgxpool.Pool, s3Client *cloud.S3Client) {
 	handlers.RegisterFriends(r, pool)
 	handlers.RegisterThoughts(r, pool, s3Client)
-	handlers.RegisterUsers(r)
+	handlers.RegisterUsers(r, pool)
 	handlers.RegisterAuthRoutes(r, pool)
 }
